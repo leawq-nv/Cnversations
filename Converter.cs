@@ -4,6 +4,11 @@ using PdfSharp.Drawing;
 using PdfSharp.Fonts;
 using PdfSharp.Pdf;
 
+// Псевдонимы для пространств имён OpenXml, связанных с рисованием —
+// чтобы не плодить длинные DocumentFormat.OpenXml.Drawing.Wordprocessing.* в коде.
+using A = DocumentFormat.OpenXml.Drawing;
+using DW = DocumentFormat.OpenXml.Drawing.Wordprocessing;
+
 namespace DocxToPdfConverter;
 
 // Логика конвертации docx -> pdf.
@@ -23,12 +28,21 @@ public class Converter
     // Отступ после параграфа.
     private const double ParagraphSpacing = 4;
 
+    // 1 пункт PDF = 12700 EMU (English Metric Units — единица измерения в OOXML).
+    private const double EmuPerPoint = 12700.0;
+
     private static bool _fontResolverRegistered;
 
     private PdfDocument _pdf = null!;
     private PdfPage _page = null!;
     private XGraphics _gfx = null!;
     private double _y; // текущая Y-координата (растёт сверху вниз)
+
+    // Главная часть документа — нужна для разрешения ссылок на встроенные картинки.
+    private MainDocumentPart _mainPart = null!;
+
+    // Ресурсы картинок (XImage и потоки), которые нужно держать живыми до Save и потом утилизировать.
+    private readonly List<IDisposable> _imageResources = new();
 
     public void Convert(string docxPath, string pdfPath, IProgress<int>? progress = null)
     {
@@ -42,31 +56,44 @@ public class Converter
         _pdf = new PdfDocument();
         AddPage();
 
-        using (var docx = WordprocessingDocument.Open(docxPath, false))
+        try
         {
-            var body = docx.MainDocumentPart?.Document?.Body
-                ?? throw new InvalidDataException("Документ не содержит тела (возможно, файл повреждён).");
-
-            // Считаем параграфы, чтобы знать общую долю работы для прогресс-бара.
-            var paragraphs = body.Elements<Paragraph>().ToList();
-            int total = paragraphs.Count;
-            int done = 0;
-
-            foreach (var paragraph in paragraphs)
+            using (var docx = WordprocessingDocument.Open(docxPath, false))
             {
-                RenderParagraph(paragraph);
-                done++;
+                _mainPart = docx.MainDocumentPart
+                    ?? throw new InvalidDataException("Главная часть документа отсутствует.");
 
-                // Сообщаем процент выполнения. Оставляем последние 5% на сохранение файла.
-                progress?.Report(total == 0 ? 95 : done * 95 / total);
+                var body = _mainPart.Document?.Body
+                    ?? throw new InvalidDataException("Документ не содержит тела (возможно, файл повреждён).");
+
+                var paragraphs = body.Elements<Paragraph>().ToList();
+                int total = paragraphs.Count;
+                int done = 0;
+
+                foreach (var paragraph in paragraphs)
+                {
+                    RenderParagraph(paragraph);
+                    done++;
+                    progress?.Report(total == 0 ? 95 : done * 95 / total);
+                }
             }
+
+            _gfx.Dispose();
+            _pdf.Save(pdfPath);
+            _pdf.Dispose();
+
+            progress?.Report(100);
         }
-
-        _gfx.Dispose();
-        _pdf.Save(pdfPath);
-        _pdf.Dispose();
-
-        progress?.Report(100);
+        finally
+        {
+            // Утилизируем ресурсы картинок только после Save — XImage держит ссылки на потоки,
+            // PdfSharp дочитывает их при сохранении.
+            foreach (var d in _imageResources)
+            {
+                try { d.Dispose(); } catch { }
+            }
+            _imageResources.Clear();
+        }
     }
 
     private void AddPage()
@@ -82,21 +109,17 @@ public class Converter
 
     private void RenderParagraph(Paragraph paragraph)
     {
-        // Стиль (например, Heading1) — для подсказок размера.
         var styleId = paragraph.ParagraphProperties?.ParagraphStyleId?.Val?.Value;
         var headingLevel = ParseHeadingLevel(styleId);
 
-        // Выравнивание абзаца.
         var alignment = ParseAlignment(paragraph.ParagraphProperties?.Justification?.Val);
 
-        // Собираем токены (слово + форматирование) из всех Run-ов.
         var tokens = new List<Token>();
         foreach (var run in paragraph.Elements<Run>())
         {
             CollectTokensFromRun(run, headingLevel, tokens);
         }
 
-        // Пустой параграф — просто пропуск строки.
         if (tokens.Count == 0)
         {
             _y += DefaultFontSize * LineSpacing;
@@ -104,7 +127,6 @@ public class Converter
             return;
         }
 
-        // Раскладываем токены по строкам с учётом ширины страницы.
         LayoutAndDraw(tokens, alignment);
 
         _y += ParagraphSpacing;
@@ -118,7 +140,6 @@ public class Converter
         bool italic = props?.Italic != null;
         bool underline = props?.Underline != null;
 
-        // Заголовки: жирный + увеличенный шрифт по уровню.
         double size;
         if (headingLevel > 0)
         {
@@ -151,8 +172,6 @@ public class Converter
 
         var brush = new XSolidBrush(color);
 
-        // Проходим по всем дочерним элементам в порядке появления:
-        // Text — обычный текст, Break — разрыв строки или страницы, TabChar — табуляция.
         foreach (var child in run.ChildElements)
         {
             switch (child)
@@ -169,12 +188,22 @@ public class Converter
                     var tabWidth = _gfx.MeasureString("    ", font).Width;
                     tokens.Add(new Token("    ", font, brush, tabWidth));
                     break;
+                case Drawing drawing:
+                    var img = TryLoadImage(drawing);
+                    if (img != null)
+                    {
+                        tokens.Add(new Token(
+                            "", font, brush,
+                            Width: img.Value.WidthPt,
+                            Kind: TokenKind.Image,
+                            Image: img.Value.Image,
+                            Height: img.Value.HeightPt));
+                    }
+                    break;
             }
         }
     }
 
-    // Разбивает текст на токены: каждое слово и каждый пробел — отдельный токен.
-    // Это нужно, чтобы корректно переносить строки по пробелам.
     private static IEnumerable<string> SplitToWords(string text)
     {
         if (string.IsNullOrEmpty(text)) yield break;
@@ -194,6 +223,78 @@ public class Converter
             yield return text.Substring(start);
     }
 
+    // ---------- Загрузка картинки из docx ----------
+
+    // Извлекает встроенную (inline) картинку из элемента <w:drawing>.
+    // Возвращает XImage и размеры в пунктах PDF, либо null, если что-то пошло не так.
+    private (XImage Image, double WidthPt, double HeightPt)? TryLoadImage(Drawing drawing)
+    {
+        try
+        {
+            // Размер картинки из <wp:extent cx="..." cy="..."/> в EMU.
+            var extent = drawing.Descendants<DW.Extent>().FirstOrDefault();
+            if (extent?.Cx?.Value is not long cx || extent.Cy?.Value is not long cy) return null;
+
+            double widthPt = cx / EmuPerPoint;
+            double heightPt = cy / EmuPerPoint;
+            if (widthPt <= 0 || heightPt <= 0) return null;
+
+            // Ссылка на ресурс картинки через relationship ID в <a:blip r:embed="..."/>.
+            var blip = drawing.Descendants<A.Blip>().FirstOrDefault();
+            var embedId = blip?.Embed?.Value;
+            if (string.IsNullOrEmpty(embedId)) return null;
+
+            if (_mainPart.GetPartById(embedId) is not ImagePart imagePart) return null;
+
+            // Копируем байты картинки в MemoryStream — он переживёт чтение docx
+            // и будет жить, пока PdfSharp дочитывает картинку при Save.
+            var ms = new MemoryStream();
+            using (var src = imagePart.GetStream())
+            {
+                src.CopyTo(ms);
+            }
+            ms.Position = 0;
+
+            XImage ximg;
+            try
+            {
+                ximg = XImage.FromStream(ms);
+            }
+            catch
+            {
+                ms.Dispose();
+                return null; // неподдерживаемый формат (например, WMF/EMF) — пропускаем
+            }
+
+            _imageResources.Add(ximg);
+            _imageResources.Add(ms);
+
+            // Если картинка шире доступной области — масштабируем по ширине.
+            double maxWidth = _page.Width.Point - 2 * Margin;
+            if (widthPt > maxWidth)
+            {
+                double scale = maxWidth / widthPt;
+                widthPt = maxWidth;
+                heightPt *= scale;
+            }
+
+            // Если выше доступной области — масштабируем по высоте (с сохранением пропорций).
+            double maxHeight = _page.Height.Point - 2 * Margin;
+            if (heightPt > maxHeight)
+            {
+                double scale = maxHeight / heightPt;
+                heightPt = maxHeight;
+                widthPt *= scale;
+            }
+
+            return (ximg, widthPt, heightPt);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     // ---------- Раскладка строк ----------
 
     private void LayoutAndDraw(List<Token> tokens, XStringAlignment alignment)
@@ -207,8 +308,7 @@ public class Converter
         {
             if (line.Count > 0)
             {
-                // Убираем висящие пробелы в конце строки (они не должны влиять на выравнивание).
-                while (line.Count > 0 && line[^1].Text == " ")
+                while (line.Count > 0 && line[^1].Text == " " && line[^1].Kind == TokenKind.Text)
                 {
                     lineWidth -= line[^1].Width;
                     line.RemoveAt(line.Count - 1);
@@ -234,15 +334,13 @@ public class Converter
                 continue;
             }
 
-            // Пробел в начале строки игнорируем.
-            if (tok.Text == " " && line.Count == 0)
+            if (tok.Text == " " && tok.Kind == TokenKind.Text && line.Count == 0)
                 continue;
 
-            // Если слово не помещается — переносим на новую строку.
             if (lineWidth + tok.Width > maxWidth && line.Count > 0)
             {
                 Flush();
-                if (tok.Text == " ") continue; // пробел в начале новой строки тоже не нужен
+                if (tok.Text == " " && tok.Kind == TokenKind.Text) continue;
             }
 
             line.Add(tok);
@@ -254,12 +352,13 @@ public class Converter
 
     private void DrawLine(List<Token> line, double lineWidth, double maxWidth, XStringAlignment alignment)
     {
-        // Высота строки = максимальная высота шрифта в строке * межстрочный интервал.
-        double lineHeight = line.Max(t => t.Font.GetHeight()) * LineSpacing;
+        // Высота строки: для текста — высота шрифта × межстрочный интервал, для картинок — их собственная высота.
+        double lineHeight = line.Max(t => t.Kind == TokenKind.Image
+            ? t.Height
+            : t.Font.GetHeight() * LineSpacing);
 
         EnsureSpace(lineHeight);
 
-        // Стартовый X в зависимости от выравнивания.
         double x = alignment switch
         {
             XStringAlignment.Center => Margin + (maxWidth - lineWidth) / 2,
@@ -267,11 +366,16 @@ public class Converter
             _ => Margin
         };
 
-        // Базовая линия — Y + высота шрифта без межстрочного бонуса.
-        // PdfSharp рисует текст по верхнему левому углу при XStringFormats.TopLeft.
         foreach (var tok in line)
         {
-            _gfx.DrawString(tok.Text, tok.Font, tok.Brush, x, _y, XStringFormats.TopLeft);
+            if (tok.Kind == TokenKind.Image && tok.Image != null)
+            {
+                _gfx.DrawImage(tok.Image, x, _y, tok.Width, tok.Height);
+            }
+            else
+            {
+                _gfx.DrawString(tok.Text, tok.Font, tok.Brush, x, _y, XStringFormats.TopLeft);
+            }
             x += tok.Width;
         }
 
@@ -290,7 +394,6 @@ public class Converter
 
     private static double? ParseFontSize(RunProperties? props)
     {
-        // В docx размер шрифта хранится в полупунктах: значение 24 = 12pt.
         var v = props?.FontSize?.Val?.Value;
         if (v == null) return null;
         if (double.TryParse(v, System.Globalization.CultureInfo.InvariantCulture, out var halfPt))
@@ -318,14 +421,12 @@ public class Converter
         var v = value.Value;
         if (v == JustificationValues.Center) return XStringAlignment.Center;
         if (v == JustificationValues.Right || v == JustificationValues.End) return XStringAlignment.Far;
-        // Justify (по ширине) пока не реализован — рисуем как обычное левое.
         return XStringAlignment.Near;
     }
 
     private static int ParseHeadingLevel(string? styleId)
     {
         if (string.IsNullOrEmpty(styleId)) return 0;
-        // Стандартные ID: "Heading1", "Heading2", ... или "Заголовок1" в локализованных версиях.
         var s = styleId.ToLowerInvariant();
         for (int level = 1; level <= 6; level++)
         {
@@ -337,12 +438,14 @@ public class Converter
 
     // ---------- Внутренние типы ----------
 
-    private enum TokenKind { Text, LineBreak, PageBreak }
+    private enum TokenKind { Text, LineBreak, PageBreak, Image }
 
     private readonly record struct Token(
         string Text,
         XFont Font,
         XBrush Brush,
         double Width,
-        TokenKind Kind = TokenKind.Text);
+        TokenKind Kind = TokenKind.Text,
+        XImage? Image = null,
+        double Height = 0);
 }

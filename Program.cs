@@ -5,14 +5,26 @@ static class Program
     [STAThread]
     static int Main(string[] args)
     {
-        // Если переданы аргументы командной строки — запускаемся в CLI-режиме без GUI.
-        // Использование: DocxToPdfConverter.exe <input.docx> <output.pdf>
+        // CLI-режим. Использование:
+        //   DocxToPdfConverter.exe <input> <output.pdf>
+        // Конвертер выбирается по расширению входного файла (.docx или .pptx).
         if (args.Length >= 2)
         {
             try
             {
-                var converter = new Converter();
-                converter.Convert(args[0], args[1]);
+                var ext = Path.GetExtension(args[0]).ToLowerInvariant();
+                switch (ext)
+                {
+                    case ".docx":
+                        new Converter().Convert(args[0], args[1]);
+                        break;
+                    case ".pptx":
+                        new PptxConverter().Convert(args[0], args[1]);
+                        break;
+                    default:
+                        Console.Error.WriteLine($"Неподдерживаемое расширение: {ext}. Поддерживаются .docx и .pptx.");
+                        return 1;
+                }
                 Console.WriteLine($"OK: {args[1]}");
                 return 0;
             }
