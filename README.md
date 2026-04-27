@@ -1,2 +1,2 @@
 # Cnversations
-u can install a app witch will be convert your docx files to pdf
+u can install это app которое will be convert your docx files to pdf
