@@ -1,0 +1,53 @@
+# ---------------- .NET / Visual Studio ----------------
+
+# Папки сборки
+bin/
+obj/
+
+# Папки публикации
+publish/
+*.publish.zip
+
+# Кеш Visual Studio
+.vs/
+
+# Пользовательские настройки (свои у каждого разработчика)
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Файлы отладки
+*.pdb
+*.dll.config
+
+# Кеш ReSharper / Rider
+_ReSharper*/
+*.[Rr]e[Ss]harper
+.idea/
+
+# VS Code
+.vscode/
+
+# Логи
+*.log
+
+# Временные файлы NuGet
+*.nupkg
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# ---------------- Windows / OS ----------------
+
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ---------------- Тестовые артефакты этого проекта ----------------
+
+# Сгенерированные тестовые файлы (создаются make_test_docx.py)
+test.pdf
+test_release.pdf
+extracted.txt
